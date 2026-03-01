@@ -1,6 +1,6 @@
 # BeforeYourAdvisor
 
-Monorepo implementation of the AI Financial Statement Classifier plan.
+Monorepo implementation of BeforeYourAdvisor, an AI powered tool to help determine which credit card transactions may be applicable for deductions with 1099 income.
 
 ## Structure
 
@@ -10,31 +10,82 @@ Monorepo implementation of the AI Financial Statement Classifier plan.
 
 ## Implemented Features
 
-- setup, env validation, session auth, Google OAuth endpoints, protected dashboard flow.
+- Session auth, Google OAuth endpoints to load files from drive, protected dashboard flow.
 - Drive folder ID parsing, Drive file listing/downloading, CSV parsing, local Coinbase PDF extraction (`pdfjs-dist` + regex section parsing), async ingestion jobs.
 - Chase/Amex/Coinbase normalization adapters, amount sign handling, dedup hashing, bulk inserts.
 - profile API + frontend gating before ingestion/analysis.
 - async analysis job worker, configurable batching (default `10`), per-transaction async LLM calls, rate-limit retry/backoff, progress polling.
-- chat with your data card that writes sql and then summarizes the results
+- Chat with your data card that writes sql and then summarizes the results
+- Stripe payment for analysis
+
+## How to use
+Go to https://beforeyouradvisor.com and make sure your email is added as a test user.  Google has a 7-10 review period for published apps so I am not able to make it generally accessible.  Please email colecrescas@gmail.com for your email to be added as a test user.  So far, I have added:
+- brett@tenex.co
+- alex@tenex.co
+- arman@tenex.co
+- dean@tenex.co
+- dan@tenex.co
+
+Login and copy a link to your drive in step 1, then select a business profile, enter some added optional info and click run analysis.  This will take you to a fake stripe landing page which you can use fake info and the card number 4242 4242 4242 4242 and an expiration date in the future.
+
+From there you will be able to chat with your data which runs simple sql queries aginst the PG db and generates a summary, keeping the past 5 chats as memory. You can also download a csv of your labeled transactions or adjust your profile and run again.  Additionally, you can view transactions or a category roll-up table.
+
+## Business Impact
+This helped me prepare for my meeting with my CPA by generating some transactions that could potentially be deductible for the 2025 tax year.  It is very similar to keepertax.com but I didn't want to pay for it.
 
 
-## API endpoints
+## What the User Gets
 
-- `GET /auth/google`
-- `GET /auth/google/callback`
-- `POST /auth/logout`
-- `GET /api/me`
-- `PUT /api/users/profile`
-- `POST /api/ingestion/start`
-- `GET /api/ingestion/status/:jobId`
-- `POST /api/analysis/start`
-- `POST /api/analysis/checkout/start`
-- `POST /api/create-checkout-session` (alias of checkout/start)
-- `GET /api/verify-session?session_id=...`
-- `POST /api/analysis/checkout/finalize`
-- `POST /api/run-analysis` (alias of checkout/finalize)
-- `GET /api/analysis/status/:jobId`
-- `GET /api/transactions?limit=&offset=&status=`
+- One flow from raw statements to analyzed expenses.
+- Support for mixed source formats (Chase CSV, Amex CSV, Coinbase PDF).
+- Business-context-aware classification using selected business profile + aggressiveness setting.
+- Progress visibility for ingestion and analysis jobs, plus downloadable results.
+- Downloadable CSV to store for local records
+- Chat with your data application for further analysis
+
+## End-to-End Flow
+
+1. User signs in with Google OAuth and grants Drive read-only access.
+2. User submits a Drive folder URL.
+3. Backend lists supported files, downloads each file, and normalizes rows into a shared transaction schema.
+4. Normalized debit transactions are stored with raw source payload + dedup hash for auditability.
+5. User saves business profile + aggressiveness level.
+6. User starts analysis job; worker classifies transactions asynchronously with retry/fallback behavior.
+7. UI polls status endpoints and renders classified transactions + category summary + CSV export.
+
+## Key Design Choices and Why
+
+- Monorepo with `apps/api`, `apps/web`, and `packages/shared`:
+  Keeps API/frontend contracts aligned via shared Zod schemas and reduces drift.
+- Session-based auth + Google OAuth:
+  Practical for a web dashboard and required for Drive integration.
+- Asynchronous job model for ingestion/analysis:
+  Avoids request timeouts and supports progress polling on long-running work.
+  Uses postgres as a job queue instead of something like Redis for simplicity.  At scale, this would need to be adjusted
+- Adapter-based normalization per institution:
+  Encodes source-specific sign/date quirks once, then writes consistent records downstream.
+  Again at scale this would need to be easier for users to either add any csv or link their credit card companies data
+- Local Coinbase PDF parsing (`pdfjs-dist`) instead of paid OCR dependency:
+  Lowers runtime cost and keeps data extraction deterministic for this known statement format.
+- Strict structured-output parsing for LLM responses (JSON schema + Zod validation):
+  Improves reliability and safely falls back to conservative defaults on provider/output failures.
+- Batch processing of LLM requests and retries with backoff on retryable errors like rate limits or structured output failures
+- Profile gating before analysis:
+  Forces user context to be explicit so classification decisions are explainable.
+- Transaction reset on re-ingest / classification reset on re-analysis:
+  Chooses data consistency and reproducibility over incremental merge complexity.
+- The architecture leaves upgrade paths (external queue, more adapters, richer analysis, linking to users credit card companies) without reworking core contracts.
+
+## Tradeoffs
+
+- The system is optimized for correctness, traceability, and shipping velocity in an MVP.
+- Reading from a users drive instead of linking to their bank / credit card transactions due to project requirements and simplicty
+- It intentionally uses a simple in-process queue first, which is easy to reason about and sufficient for early-stage load.  Redis could be added later if needed for scale
+- Analysis writes transaction updates one-by-one and the frontend uses a 2.5s polling strategy for job status rather than push channels (SSE/WebSocket)
+- The deployment is very simple with one small stack of postgres + app + caddy with no auto-scaling.  The user base is capped up to 100 test users limited by google auth so the risk is small
+- Secrets are loaded from an env file vs a secrets manager for simplicty.
+
+
 
 ## Local setup
 
@@ -49,91 +100,3 @@ To stop Postgres:
 `docker compose down`
 
 Default Postgres host port for this project is `5433` to avoid collisions with other local Postgres containers.
-
-## VPS deployment with Docker
-
-This repo includes a production Docker stack with:
-
-- `app`: Express API + built React frontend served from the same container/origin.
-- `postgres`: PostgreSQL 16 with persistent Docker volume.
-- `caddy`: reverse proxy + automatic TLS certificates for HTTPS.
-
-### 1. Prepare production env file
-
-1. Copy `.env.production.example` to `.env.production`.
-2. Fill in all secrets and production values.
-3. Keep these aligned:
-   - `APP_ORIGIN=https://beforeyouradvisor.com`
-   - `GOOGLE_CALLBACK_URL=https://beforeyouradvisor.com/auth/google/callback`
-   - `STRIPE_SUCCESS_URL=https://beforeyouradvisor.com/?checkout_session_id={CHECKOUT_SESSION_ID}`
-   - `STRIPE_CANCEL_URL=https://beforeyouradvisor.com/?checkout_cancelled=1`
-   - `DATABASE_URL=postgres://<user>:<password>@postgres:5432/<db>`
-4. Set `POSTGRES_USER`, `POSTGRES_PASSWORD`, and `POSTGRES_DB` to match `DATABASE_URL`.
-
-### 2. Build and run on VPS
-
-```bash
-docker compose --env-file .env.production -f docker-compose.prod.yml up -d --build
-```
-
-Check services:
-
-```bash
-docker compose --env-file .env.production -f docker-compose.prod.yml ps
-docker compose --env-file .env.production -f docker-compose.prod.yml logs -f app
-docker compose --env-file .env.production -f docker-compose.prod.yml logs -f caddy
-```
-
-Stop stack:
-
-```bash
-docker compose --env-file .env.production -f docker-compose.prod.yml down
-```
-
-The Postgres volume (`beforeyouradvisor_pgdata`) keeps data between restarts.
-
-### 3. Update external providers
-
-- Google OAuth allowed origin: `https://beforeyouradvisor.com`
-- Google OAuth callback: `https://beforeyouradvisor.com/auth/google/callback`
-- Stripe checkout return URLs should match the values in `.env.production`
-
-## Where to get google credentials
-To get this project running, you’ll need to acquire API credentials from Google. Create a `.env` file in the root directory and populate it using the guide below.
-
-### 1. Google OAuth Credentials (`CLIENT_ID` & `SECRET`)
-
-These are required for Google Login.
-
-1. Go to the [Google Cloud Console](https://console.cloud.google.com/).
-2. **Create a New Project** (or select an existing one).
-3. Navigate to **APIs & Services > OAuth consent screen**. Complete the internal/external setup.
-4. Go to **Credentials > Create Credentials > OAuth client ID**.
-5. Select **Web application** as the application type.
-6. **Authorized Redirect URIs**: Add `http://localhost:4000/auth/google/callback` (or your specific callback URL).
-7. Copy the **Client ID** and **Client Secret** into your `.env`.
-
-### 2. Gemini API Key
-
-This powers the AI features of the application.
-
-1. Visit [Google AI Studio](https://aistudio.google.com/).
-2. Sign in with your Google account.
-3. Click on **"Get API key"** in the sidebar.
-4. Click **"Create API key in new project"**.
-5. Copy the generated key and paste it into `GEMINI_API_KEY`.
-
-### 3. Google Callback URL
-
-This must match the URL you whitelisted in the Google Cloud Console. For local development, this is typically:
-`http://localhost:4000/auth/google/callback`
-
-
-## Notes
-
-- If `GEMINI_API_KEY` is not set, analysis uses a safe fallback classification.
-- Coinbase PDF parsing runs locally in the API process (no paid OCR dependency).
-- Analysis tuning env vars:
-  - `ANALYSIS_BATCH_SIZE` (default `10`)
-  - `LLM_MAX_RETRIES` (default `4`, retries only on rate-limit style errors)
-  - `LLM_RETRY_BASE_MS` (default `500`, exponential backoff base)
